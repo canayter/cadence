@@ -8,37 +8,53 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = "http://ws.audioscrobbler.com/2.0/"
-API_KEY = os.getenv("LASTFM_API_KEY", "e378145b1e2b44eb782e251f6baa2ff9")
-API_SECRET = os.getenv("LASTFM_API_SECRET", "43aa6cccde0beba1f8deb9a09d0f5bda")
+BASE_URL    = "http://ws.audioscrobbler.com/2.0/"
+AUTH_URL    = "https://www.last.fm/api/auth/"
+API_KEY     = os.getenv("LASTFM_API_KEY",    "e378145b1e2b44eb782e251f6baa2ff9")
+API_SECRET  = os.getenv("LASTFM_API_SECRET", "43aa6cccde0beba1f8deb9a09d0f5bda")
 AVG_TRACK_MINUTES = 3.5
 
 
 class LastFMClient:
     """
-    Read-only Last.fm client. No session key required.
-    Works entirely off public profile data using API key only.
+    Last.fm client. Works for public profiles with API key only.
+    Pass session_key to unlock private profiles and authenticated requests.
     """
 
-    def __init__(self, username: str):
-        self.username = username
-        self.api_key = API_KEY
-        self.api_secret = API_SECRET
+    def __init__(self, username: str, session_key: str = None):
+        self.username    = username
+        self.api_key     = API_KEY
+        self.api_secret  = API_SECRET
+        self.session_key = session_key or os.getenv("LASTFM_SESSION_KEY")
         self._tag_cache: dict = {}
 
     # ------------------------------------------------------------------
-    # Reused verbatim from Last.fm Insights/lastfm-insights.py
+    # Signature + DataFrame helpers (reused from Last.fm Insights)
     # ------------------------------------------------------------------
 
     def generate_api_signature(self, params: dict) -> str:
-        """MD5 signature per Last.fm spec."""
+        """MD5 signature per Last.fm spec. Excludes 'format' and 'api_sig'."""
         params_copy = params.copy()
         params_copy.pop('format', None)
         params_copy.pop('api_sig', None)
-        sorted_params = sorted(params_copy.items())
-        sig_str = ''.join(k + str(v) for k, v in sorted_params)
+        sig_str = ''.join(k + str(v) for k, v in sorted(params_copy.items()))
         sig_str += self.api_secret
         return hashlib.md5(sig_str.encode('utf-8')).hexdigest()
+
+    def _sign(self, params: dict) -> dict:
+        """Add api_sig to a params dict (in-place) and return it."""
+        params['api_sig'] = self.generate_api_signature(params)
+        return params
+
+    def _auth_params(self, base: dict) -> dict:
+        """
+        If a session key is available, add sk + api_sig to params.
+        This enables access to private profiles.
+        """
+        if self.session_key:
+            base['sk'] = self.session_key
+            self._sign(base)
+        return base
 
     def create_listening_df(self, raw_data: dict) -> pd.DataFrame:
         """Convert raw recenttracks JSON to enriched DataFrame."""
@@ -69,12 +85,60 @@ class LastFMClient:
         return df
 
     # ------------------------------------------------------------------
+    # Auth — 3-step Last.fm desktop auth flow
+    # ------------------------------------------------------------------
+
+    def get_auth_token(self) -> tuple:
+        """
+        Step 1: Request a one-time token from Last.fm.
+        Returns (token, auth_url) where auth_url is what the user must visit.
+        The original Last.fm Insights code skipped this step, which is why
+        auth never worked — you MUST get a token first, then build the auth URL.
+        """
+        params = {
+            'method':  'auth.getToken',
+            'api_key': self.api_key,
+            'format':  'json',
+        }
+        self._sign(params)
+        resp = requests.get(BASE_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if 'error' in data:
+            raise ValueError(f"Last.fm error {data['error']}: {data.get('message', '')}")
+        token    = data['token']
+        auth_url = f"{AUTH_URL}?api_key={self.api_key}&token={token}"
+        return token, auth_url
+
+    def exchange_token_for_session(self, token: str) -> str:
+        """
+        Step 3: After user has authorized the token (step 2 = visiting auth_url),
+        exchange it for a permanent session key.
+        Returns the session key string.
+        """
+        params = {
+            'method':  'auth.getSession',
+            'api_key': self.api_key,
+            'token':   token,
+            'format':  'json',
+        }
+        self._sign(params)
+        resp = requests.get(BASE_URL, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+        if 'error' in data:
+            raise ValueError(f"Last.fm error {data['error']}: {data.get('message', '')}")
+        session_key      = data['session']['key']
+        self.session_key = session_key
+        return session_key
+
+    # ------------------------------------------------------------------
     # Period helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def get_period_timestamps(period: str) -> tuple:
-        now = int(time.time())
+        now  = int(time.time())
         days = 7 if period == 'weekly' else 30
         return now - days * 24 * 60 * 60, now
 
@@ -83,19 +147,19 @@ class LastFMClient:
         return '7day' if period == 'weekly' else '1month'
 
     # ------------------------------------------------------------------
-    # Data fetching
+    # Data fetching — all requests signed when session_key is present
     # ------------------------------------------------------------------
 
     def fetch_recent_tracks(self, period: str = 'weekly') -> dict:
         """Paginated fetch of user.getrecenttracks for the given period."""
         from_ts, to_ts = self.get_period_timestamps(period)
         all_tracks = []
-        page = 1
+        page       = 1
         total_pages = 1
-        last_attr = {}
+        last_attr  = {}
 
         while page <= total_pages:
-            params = {
+            params = self._auth_params({
                 'method':  'user.getrecenttracks',
                 'user':    self.username,
                 'api_key': self.api_key,
@@ -104,15 +168,15 @@ class LastFMClient:
                 'page':    page,
                 'from':    from_ts,
                 'to':      to_ts,
-            }
+            })
             resp = requests.get(BASE_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
             if 'error' in data:
                 raise ValueError(f"Last.fm API error {data['error']}: {data.get('message', '')}")
-            last_attr = data['recenttracks'].get('@attr', {})
+            last_attr   = data['recenttracks'].get('@attr', {})
             total_pages = int(last_attr.get('totalPages', 1))
-            tracks = data['recenttracks']['track']
+            tracks      = data['recenttracks']['track']
             if isinstance(tracks, dict):
                 tracks = [tracks]
             all_tracks.extend(tracks)
@@ -121,14 +185,14 @@ class LastFMClient:
         return {'recenttracks': {'track': all_tracks, '@attr': last_attr}}
 
     def fetch_top_artists(self, period: str = 'weekly', limit: int = 10) -> list:
-        params = {
+        params = self._auth_params({
             'method':  'user.gettopartists',
             'user':    self.username,
             'api_key': self.api_key,
             'format':  'json',
             'period':  self.period_to_lastfm_str(period),
             'limit':   limit,
-        }
+        })
         resp = requests.get(BASE_URL, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -140,48 +204,40 @@ class LastFMClient:
         ]
 
     def fetch_top_tracks(self, period: str = 'weekly', limit: int = 10) -> list:
-        params = {
+        params = self._auth_params({
             'method':  'user.gettoptracks',
             'user':    self.username,
             'api_key': self.api_key,
             'format':  'json',
             'period':  self.period_to_lastfm_str(period),
             'limit':   limit,
-        }
+        })
         resp = requests.get(BASE_URL, params=params)
         resp.raise_for_status()
         data = resp.json()
         if 'error' in data:
             raise ValueError(f"Last.fm API error {data['error']}: {data.get('message', '')}")
         return [
-            {
-                'name':      t['name'],
-                'artist':    t['artist']['name'],
-                'playcount': int(t['playcount'])
-            }
+            {'name': t['name'], 'artist': t['artist']['name'], 'playcount': int(t['playcount'])}
             for t in data['toptracks']['track']
         ]
 
     def fetch_top_albums(self, period: str = 'weekly', limit: int = 10) -> list:
-        params = {
+        params = self._auth_params({
             'method':  'user.gettopalbums',
             'user':    self.username,
             'api_key': self.api_key,
             'format':  'json',
             'period':  self.period_to_lastfm_str(period),
             'limit':   limit,
-        }
+        })
         resp = requests.get(BASE_URL, params=params)
         resp.raise_for_status()
         data = resp.json()
         if 'error' in data:
             raise ValueError(f"Last.fm API error {data['error']}: {data.get('message', '')}")
         return [
-            {
-                'name':      a['name'],
-                'artist':    a['artist']['name'],
-                'playcount': int(a['playcount'])
-            }
+            {'name': a['name'], 'artist': a['artist']['name'], 'playcount': int(a['playcount'])}
             for a in data['topalbums']['album']
         ]
 
@@ -190,7 +246,6 @@ class LastFMClient:
     # ------------------------------------------------------------------
 
     def fetch_artist_tags(self, artist_name: str, top_n: int = 3) -> list:
-        """Get top tags for an artist. Results cached per instance."""
         if artist_name in self._tag_cache:
             return self._tag_cache[artist_name]
         params = {
@@ -210,13 +265,11 @@ class LastFMClient:
         return tags
 
     def enrich_df_with_tags(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add a 'tags' column (list[str]) to the scrobble DataFrame."""
         if df.empty:
             df = df.copy()
             df['tags'] = []
             return df
-        unique_artists = df['artist'].unique()
-        tag_map = {artist: self.fetch_artist_tags(artist) for artist in unique_artists}
+        tag_map = {a: self.fetch_artist_tags(a) for a in df['artist'].unique()}
         df = df.copy()
         df['tags'] = df['artist'].map(tag_map)
         return df
@@ -226,17 +279,10 @@ class LastFMClient:
     # ------------------------------------------------------------------
 
     def get_digest_data(self, period: str = 'weekly') -> dict:
-        """
-        Fetches everything needed for a digest.
-        Returns a bundle dict consumed by digest.py.
-        """
         raw = self.fetch_recent_tracks(period)
-        df = self.create_listening_df(raw)
-        df = self.enrich_df_with_tags(df)
-
+        df  = self.create_listening_df(raw)
+        df  = self.enrich_df_with_tags(df)
         total_scrobbles = len(df)
-        listening_hours = round(total_scrobbles * AVG_TRACK_MINUTES / 60, 1)
-
         return {
             'period':          period,
             'username':        self.username,
@@ -245,5 +291,5 @@ class LastFMClient:
             'top_tracks':      self.fetch_top_tracks(period),
             'top_albums':      self.fetch_top_albums(period),
             'total_scrobbles': total_scrobbles,
-            'listening_hours': listening_hours,
+            'listening_hours': round(total_scrobbles * AVG_TRACK_MINUTES / 60, 1),
         }

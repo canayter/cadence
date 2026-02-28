@@ -185,6 +185,8 @@ for key, default in [
     ('posts_preview',  []),
     ('post_status',    None),
     ('post_uris',      []),
+    ('lastfm_token',   None),   # pending auth token
+    ('lastfm_sk',      os.getenv("LASTFM_SESSION_KEY", "")),  # session key
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -201,6 +203,55 @@ with st.sidebar:
         label_visibility="collapsed",
     )
     period = st.selectbox("Period", ["weekly", "monthly"])
+
+    # ── Last.fm auth (required for private profiles) ──────────────────────
+    st.divider()
+    st.markdown('<div class="sidebar-label">Last.fm Auth</div>', unsafe_allow_html=True)
+
+    if st.session_state.lastfm_sk:
+        st.markdown(
+            '<div style="color:#34d399;font-size:0.8rem;">✓ Connected</div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("Disconnect", use_container_width=True):
+            st.session_state.lastfm_sk    = ""
+            st.session_state.lastfm_token = None
+            st.rerun()
+        st.caption("Save this to .env to skip auth next time:")
+        st.code(st.session_state.lastfm_sk, language=None)
+    else:
+        st.caption("Required for private profiles.")
+
+        # Step 1 — get a token and show auth URL
+        if st.button("Step 1 — Get auth link", use_container_width=True):
+            try:
+                from lastfm import LastFMClient as _LFM
+                token, auth_url = _LFM(username or "x").get_auth_token()
+                st.session_state.lastfm_token = token
+                st.session_state._auth_url    = auth_url
+            except Exception as e:
+                st.error(f"Could not get token: {e}")
+
+        if st.session_state.lastfm_token:
+            auth_url = getattr(st.session_state, '_auth_url', '')
+            st.markdown(
+                f'<a href="{auth_url}" target="_blank" style="color:#00d4ff;font-size:0.82rem;">'
+                '→ Authorize on Last.fm</a>',
+                unsafe_allow_html=True,
+            )
+            st.caption("After authorizing in your browser, click below.")
+
+            # Step 3 — exchange token for session key
+            if st.button("Step 2 — Complete connection", use_container_width=True):
+                try:
+                    from lastfm import LastFMClient as _LFM
+                    client = _LFM(username or "x")
+                    sk = client.exchange_token_for_session(st.session_state.lastfm_token)
+                    st.session_state.lastfm_sk    = sk
+                    st.session_state.lastfm_token = None
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Auth failed — did you authorize the link first? ({e})")
 
     st.divider()
     st.markdown('<div class="sidebar-label">Filters (optional)</div>', unsafe_allow_html=True)
@@ -243,7 +294,10 @@ if fetch_btn:
     else:
         with st.spinner("Fetching scrobble data from Last.fm…"):
             try:
-                client   = LastFMClient(username=username)
+                client   = LastFMClient(
+                    username=username,
+                    session_key=st.session_state.lastfm_sk or None,
+                )
                 raw_data = client.get_digest_data(period)
                 filtered = apply_filters(
                     raw_data,
